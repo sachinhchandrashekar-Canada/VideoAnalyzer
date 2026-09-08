@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Simple SRT/URL analyser using ffprobe.
+"""Simple SRT/RIST/URL analyser using ffprobe.
 
-This mirrors the rtpm_analyser functionality but is provided as a
-separate module for clarity. It queries ffprobe for format/stream metadata
-for SRT (or other URL) inputs and prints JSON output.
+This provides a lightweight inspector for SRT, RIST, and other URL-based inputs.
+It queries ffprobe for format and stream metadata, and can optionally include
+frame- and packet-level output.
 """
 from __future__ import annotations
+
 import argparse
 import json
 import subprocess
-import sys
-from typing import List, Dict, Any, Optional
+from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, List, Optional
 
 
 def ffprobe_json(url: str, args: List[str]) -> Optional[Dict[str, Any]]:
@@ -18,18 +19,57 @@ def ffprobe_json(url: str, args: List[str]) -> Optional[Dict[str, Any]]:
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, encoding="utf-8")
         return json.loads(out)
-    except subprocess.CalledProcessError as e:
-        print(f"ffprobe failed: {e}")
+    except subprocess.CalledProcessError as exc:
+        print(f"ffprobe failed: {exc}")
         return None
-    except json.JSONDecodeError as e:
-        print(f"failed to decode ffprobe output as JSON: {e}")
+    except json.JSONDecodeError as exc:
+        print(f"failed to decode ffprobe output as JSON: {exc}")
         return None
+
+
+def parse_transport_url(url: str) -> Dict[str, Any]:
+    parsed = urlparse(url)
+    query = {key: values[-1] for key, values in parse_qs(parsed.query, keep_blank_values=True).items()}
+    protocol = (parsed.scheme or "").lower()
+    transport = {
+        "protocol": protocol,
+        "host": parsed.hostname,
+        "port": parsed.port,
+        "path": parsed.path,
+        "query": query,
+        "supports_live_transport_stats": False,
+        "capabilities": {
+            "runtime_stats": False,
+            "rtt": False,
+            "retransmissions": False,
+            "packet_loss": False,
+            "jitter": False,
+        },
+        "limitations": [
+            "Live RTT, retransmission, and packet-loss counters are not available in this ffprobe-based inspector.",
+            "Native libsrt/librist stats access is required to expose true live transport counters."
+        ],
+        "notes": [],
+    }
+
+    if protocol == "srt":
+        transport["notes"].append("This build can open SRT URLs through FFmpeg, but runtime SRT stats are not exposed without a native libsrt binding.")
+        transport["notes"].append("URL options such as mode, latency, streamid, nakreport, tlpktdrop, and encryption settings are reported when present.")
+        transport["configured_options"] = {k: query[k] for k in sorted(query)}
+    elif protocol == "rist":
+        transport["notes"].append("This build can open RIST URLs through FFmpeg, but runtime librist transport stats are not exposed here.")
+        transport["configured_options"] = {k: query[k] for k in sorted(query)}
+    else:
+        transport["notes"].append("URL is not using the SRT or RIST transport protocol.")
+
+    return transport
 
 
 def analyze_url(url: str, show_frames: bool = False, show_packets: bool = False) -> None:
     data = ffprobe_json(url, ["-show_format", "-show_streams"]) or {}
     out = {
         "url": url,
+        "transport": parse_transport_url(url),
         "format": data.get("format"),
         "streams": data.get("streams", []),
     }
@@ -46,11 +86,11 @@ def analyze_url(url: str, show_frames: bool = False, show_packets: bool = False)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="SRT/URL analyser using ffprobe")
-    p.add_argument("urls", nargs="+", help="SRT/RTMP/HTTP/etc. URL(s) to analyze")
-    p.add_argument("--frames", action="store_true", help="Attempt to show frame-level info (may block for live sources)")
-    p.add_argument("--packets", action="store_true", help="Attempt to show packet-level info (may block for live sources)")
-    args = p.parse_args(argv)
+    parser = argparse.ArgumentParser(description="SRT/RIST/URL analyser using ffprobe")
+    parser.add_argument("urls", nargs="+", help="SRT/RIST/RTMP/HTTP/etc. URL(s) to analyze")
+    parser.add_argument("--frames", action="store_true", help="Attempt to show frame-level info")
+    parser.add_argument("--packets", action="store_true", help="Attempt to show packet-level info")
+    args = parser.parse_args(argv)
 
     for url in args.urls:
         try:

@@ -262,14 +262,6 @@ try:
 except Exception:
     RTMP_ANALYSER_AVAILABLE = False
 
-# Optional SRT analyser (ffprobe wrapper)
-try:
-    import srt_analyser
-    SRT_ANALYSER_AVAILABLE = True
-except Exception:
-    SRT_ANALYSER_AVAILABLE = False
-
-
 class TR101290ErrorClassifier:
     """Classifies errors according to TR101-290 Priority levels (ETSI TR 101 290 V1.2.1)"""
     
@@ -803,6 +795,7 @@ class TSAnalyserGUI:
         file_menu.add_command(label="Open Media File...", command=self.browse_file, accelerator="Ctrl+O")
         file_menu.add_command(label="Open Network Stream...", command=self.open_network_stream)
         file_menu.add_command(label="Open URL Stream...", command=self.open_url_stream)
+        file_menu.add_command(label="Open SRT Stream Inspector...", command=self.open_srt_stream)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit, accelerator="Ctrl+Q")
         
@@ -917,6 +910,103 @@ class TSAnalyserGUI:
         x = self.root.winfo_x() + (self.root.winfo_width() - dlg.winfo_width()) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
         dlg.geometry(f"+{x}+{y}")
+
+    def open_srt_stream(self):
+        """Open an SRT or RIST URL in the ffprobe-based inspector."""
+        if not SRT_ANALYSER_AVAILABLE:
+            messagebox.showerror("Inspector Missing", "SRT/RIST inspector is not available. ffprobe and the srt_analyser module are required.")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Open SRT/RIST Inspector")
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, text="SRT/RIST URL").grid(row=0, column=0, padx=8, pady=6, sticky=tk.W)
+        url_var = tk.StringVar(value="srt://example:9000?streamid=someid")
+        ttk.Entry(dlg, textvariable=url_var, width=60).grid(row=0, column=1, padx=8, pady=6, sticky=tk.W)
+
+        show_frames_var = tk.BooleanVar(value=False)
+        show_packets_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dlg, text="Show frames", variable=show_frames_var).grid(row=1, column=0, padx=8, pady=6, sticky=tk.W)
+        ttk.Checkbutton(dlg, text="Show packets", variable=show_packets_var).grid(row=1, column=1, padx=8, pady=6, sticky=tk.W)
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=2, column=0, columnspan=2, pady=10)
+
+        def do_cancel():
+            dlg.destroy()
+
+        def do_open():
+            dlg.destroy()
+            url = url_var.get().strip()
+            threading.Thread(
+                target=self._run_srt_inspect,
+                args=(url, show_frames_var.get(), show_packets_var.get()),
+                daemon=True,
+            ).start()
+
+        ttk.Button(btns, text="Cancel", command=do_cancel).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btns, text="Inspect", command=do_open).pack(side=tk.RIGHT, padx=6)
+
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    def _run_srt_inspect(self, url: str, show_frames: bool, show_packets: bool):
+        """Run SRT/RIST inspection via the bundled `srt_analyser` module and show output."""
+        if not SRT_ANALYSER_AVAILABLE:
+            self.root.after(0, lambda: self.show_error("SRT/RIST inspector not available (missing ffprobe or module)."))
+            return
+
+        def make_win():
+            window = tk.Toplevel(self.root)
+            window.title(f"SRT/RIST Inspector: {url}")
+            text_widget = scrolledtext.ScrolledText(window, width=100, height=40)
+            text_widget.pack(fill=tk.BOTH, expand=True)
+            return window, text_widget
+
+        window, text_widget = None, None
+        try:
+            self.root.after(0, lambda: self.status_label.config(text=f"Inspecting {url} with ffprobe...", foreground="orange"))
+            window, text_widget = make_win()
+            data = srt_analyser.ffprobe_json(url, ["-show_format", "-show_streams"]) or {}
+            out = {
+                "url": url,
+                "transport": srt_analyser.parse_transport_url(url),
+                "format": data.get("format"),
+                "streams": data.get("streams", []),
+            }
+            if show_frames:
+                frames = srt_analyser.ffprobe_json(url, ["-show_frames"]) or {}
+                out["frames"] = frames.get("frames", [])
+            if show_packets:
+                packets = srt_analyser.ffprobe_json(url, ["-show_packets"]) or {}
+                out["packets"] = packets.get("packets", [])
+
+            payload = json.dumps(out, indent=2)
+            limitation_message = (
+                "Transport configuration is available; live RTT/retransmission/packet-loss counters are unavailable "
+                "here because this inspector does not have native libsrt/librist stats access."
+            )
+
+            def write_text():
+                try:
+                    text_widget.delete('1.0', tk.END)
+                    text_widget.insert(tk.END, limitation_message + "\n\n")
+                    text_widget.insert(tk.END, payload)
+                except Exception:
+                    pass
+
+            self.root.after(0, write_text)
+            self.root.after(0, lambda: self.status_label.config(text="SRT/RIST inspect completed", foreground="green"))
+        except Exception as exc:
+            self.root.after(0, self.show_error, f"SRT/RIST inspect failed: {exc}")
+            if window:
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
 
     def _open_url_and_analyze(self, url, refresh_s):
         """Open a streaming URL via PyAV and analyze according to container; periodically refresh if requested."""
